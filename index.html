@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
-  <meta name="app-version" content="20260905-match-social-reconnect">
+  <meta name="app-version" content="20260905-disconnect-notice">
   <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
   <title>盲区 BLIND SPOT</title>
   <style>
@@ -199,6 +199,8 @@ let selectedMatchMode='duel', match=null, localSeat=0, nextReady=false, peerRead
 let playerNames=['玩家 A','玩家 B'], networkPaused=false;
 let reconnectTimer=0, reconnectTries=0, partnerId=null, receivedAt=0, connectionEpoch=0;
 let connectingSince=0;
+const HEARTBEAT_TIMEOUT=6000;
+let connectionLostAt=0, partnerLeft=false;
 let outgoingSeq=0, incomingSeq=0, outgoing=new Map(), sessionKey=null;
 let emoteMuted=false, sentEmoteAt=-Infinity, receivedEmoteAt=-Infinity, emoteTimer=0;
 const emotes=['😏 就这点准头？','😎 你确定往这打？','👀 我可看着呢','🎯 下一发见真章','😂 心态要稳！','👏 这发漂亮！'];
@@ -228,7 +230,8 @@ featureStyle.textContent=`
 document.head.append(featureStyle);
 const matchBanner=document.createElement('div');matchBanner.id='matchBanner';$('.top').append(matchBanner);
 const connectionNotice=document.createElement('div');connectionNotice.id='connectionNotice';connectionNotice.hidden=true;
-connectionNotice.innerHTML='<div><h2>正在恢复连接</h2><p id="reconnectText">进度已经保留，请保持页面开启。</p><button class="primary" id="retryLink">立即重试</button><button class="secondary" id="leaveLink">离开房间</button></div>';
+connectionNotice.setAttribute('role','alertdialog');connectionNotice.setAttribute('aria-modal','true');connectionNotice.setAttribute('aria-labelledby','connectionTitle');
+connectionNotice.innerHTML='<div><h2 id="connectionTitle">对方连接中断</h2><p id="reconnectText">正在等待对方重连，进度已保留。</p><button class="primary" id="retryLink">立即重试</button><button class="secondary" id="leaveLink">返回大厅</button></div>';
 document.body.append(connectionNotice);
 const emoteDock=document.createElement('div');emoteDock.id='emoteDock';emoteDock.hidden=true;
 emoteDock.innerHTML='<button id="emoteToggle" aria-expanded="false">😏 互动</button><div id="emoteMenu" hidden></div>';
@@ -290,15 +293,23 @@ go=function(next){oldGo(next);if(next==='reveal'){recordResult(Number($('#scoreB
 // Reliable events are replayed after reconnect and applied once in sequence.
 function rawSend(message){if(conn?.open)try{conn.send(message)}catch{pauseConnection()}}
 sendNet=function(data){if(netMode!=='online'&&netMode!=='room'&&!conn)return;if(['aim','emote'].includes(data.type)){rawSend({protocol:2,kind:'ephemeral',data});return}const packet={protocol:2,kind:'event',seq:++outgoingSeq,data};outgoing.set(packet.seq,packet);rawSend(packet)};
-function pauseConnection(){if(!sessionKey)return;networkPaused=true;connectionNotice.hidden=false;$('#shell').classList.add('connection-paused');clearTimeout(revealTimer);scheduleReconnect()}
-function unpauseConnection(){networkPaused=false;connectionNotice.hidden=true;$('#shell').classList.remove('connection-paused');reconnectTries=0;clearTimeout(reconnectTimer);reconnectTimer=0;if(voiceReady)sendNet({type:'voiceReady'})}
-function scheduleReconnect(){if(reconnectTimer||!sessionKey)return;reconnectTimer=setTimeout(()=>{reconnectTimer=0;retryConnection()},3000)}
-function retryConnection(){if(!sessionKey)return;reconnectTries++;$('#reconnectText').textContent=`进度已保留，正在尝试重连（${reconnectTries}）。请两位玩家回到游戏页面。`;
+function renderConnectionNotice(){
+  const seconds=Math.max(0,Math.floor((Date.now()-connectionLostAt)/1000));
+  $('#connectionTitle').textContent=partnerLeft?'对方已离开房间':navigator.onLine===false?'你的网络已断开':'对方连接中断';
+  $('#reconnectText').textContent=partnerLeft?'对方主动退出了房间，本场无法继续。请返回大厅重新邀请朋友。':navigator.onLine===false?`请检查 Wi-Fi 或移动网络。对局已暂停，进度已保留。已等待 ${seconds} 秒。`:`暂时收不到对方回应，正在等待重连。对局已暂停，进度已保留。已等待 ${seconds} 秒。${seconds>=30?'你可以继续等，也可以返回大厅。':'请两位玩家保持游戏页面开启。'}`;
+  $('#retryLink').hidden=partnerLeft;$('#retryLink').disabled=partnerLeft;
+}
+function pauseConnection(){if(!sessionKey||!match)return;if(!networkPaused)connectionLostAt=Date.now();networkPaused=true;connectionNotice.hidden=false;$('#shell').classList.add('connection-paused');$('#shell').inert=$('#lobby').inert=true;renderConnectionNotice();clearTimeout(revealTimer);if(!partnerLeft)scheduleReconnect()}
+function unpauseConnection(){if(partnerLeft||navigator.onLine===false)return;const wasPaused=networkPaused;networkPaused=false;connectionLostAt=0;connectionNotice.hidden=true;$('#shell').classList.remove('connection-paused');$('#shell').inert=$('#lobby').inert=false;reconnectTries=0;clearTimeout(reconnectTimer);reconnectTimer=0;if(wasPaused)toast('双方连接已恢复，可以继续本轮');if(voiceReady)sendNet({type:'voiceReady'})}
+function scheduleReconnect(){if(reconnectTimer||!sessionKey||partnerLeft)return;reconnectTimer=setTimeout(()=>{reconnectTimer=0;retryConnection()},3000)}
+function retryConnection(){if(!sessionKey||partnerLeft)return;reconnectTries++;if(networkPaused)renderConnectionNotice();
   if(peer?.disconnected)try{peer.reconnect()}catch{}
-  if(conn?.open&&Date.now()-receivedAt<10000){rawSend({protocol:2,kind:'hello',sessionKey});rawSend({protocol:2,kind:'ping'})}
+  if(conn?.open&&Date.now()-receivedAt<HEARTBEAT_TIMEOUT){rawSend({protocol:2,kind:'hello',sessionKey});rawSend({protocol:2,kind:'ping'})}
   else if(!isHost&&peer?.open&&(!connectingSince||Date.now()-connectingSince>12000)){const c=peer.connect(`blindspot-${roomCode}`,{reliable:true,metadata:{sessionKey}});wireConnection(c)}scheduleReconnect()
 }
 function deliverPacket(packet){if(!packet||packet.protocol!==2)return;receivedAt=Date.now();
+  if(packet.kind==='peerLeaving'){partnerLeft=true;clearTimeout(reconnectTimer);reconnectTimer=0;pauseConnection();return}
+  if(partnerLeft)return;
   if(packet.kind==='hello'){if(isHost&&packet.sessionKey!==sessionKey)return;unpauseConnection();rawSend({protocol:2,kind:'ack',seq:incomingSeq});for(const event of outgoing.values())rawSend(event);return}
   if(packet.kind==='ping'){rawSend({protocol:2,kind:'pong'});return}if(packet.kind==='pong'){if(networkPaused){unpauseConnection();for(const event of outgoing.values())rawSend(event)}return}
   if(packet.kind==='ack'){for(const seq of outgoing.keys())if(seq<=packet.seq)outgoing.delete(seq);return}
@@ -312,11 +323,10 @@ wireConnection=function(c){const previous=conn,epoch=++connectionEpoch;conn=c;co
   c.on('open',()=>{if(epoch!==connectionEpoch){c.close();return}connectingSince=0;receivedAt=Date.now();if(previous&&previous!==c)previous.close();
     rawSend({protocol:2,kind:'hello',sessionKey});for(const event of outgoing.values())rawSend(event);
     if(isHost&&!match){match=newMatch();localSeat=0;sendNet({type:'matchWelcome',sessionKey,match:clone(match),names:playerNames,roomCode});oldRoleRoom();updateMatchBanner()}
-    if(networkPaused)unpauseConnection();
   });c.on('close',()=>{if(epoch===connectionEpoch){connectingSince=0;pauseConnection()}});c.on('error',()=>{if(epoch===connectionEpoch){connectingSince=0;pauseConnection()}});
 };
 const oldInitPeer=initPeer;
-initPeer=function(id,onOpen,onError){oldInitPeer(id,onOpen,onError);peer.on('disconnected',()=>{if(sessionKey){try{peer.reconnect()}catch{}pauseConnection()}})};
+initPeer=function(id,onOpen,onError){oldInitPeer(id,onOpen,onError);peer.on('disconnected',()=>{if(sessionKey){try{peer.reconnect()}catch{}if(!conn?.open)pauseConnection()}})};
 createOnlineRoom=function(){playerNames=[safeName(hostForm.querySelector('.player-name').value,'玩家 A'),'玩家 B'];selectedMatchMode=hostForm.querySelector('select').value;isHost=true;localSeat=0;sessionKey=crypto.randomUUID();roomCode=String(Math.floor(100000+Math.random()*900000));$('#lobbyRoomCode').textContent=roomCode;$('#lobbyStatus').textContent='正在建立房间…';lobbyView('waitingBox');
   initPeer(`blindspot-${roomCode}`,()=>{$('#lobbyStatus').textContent=`${matchModes[selectedMatchMode].label} · 等待朋友加入`;peer.on('connection',c=>{if(partnerId&&c.peer!==partnerId){c.close();return}if(match&&c.metadata?.sessionKey!==sessionKey){c.close();return}partnerId=c.peer;wireConnection(c)})},message=>$('#lobbyStatus').textContent=message)
 };
@@ -336,10 +346,12 @@ receiveNet=function(data){if(!data||typeof data!=='object')return;
 revealOnline=function(){const good=shots.filter(s=>s.gain>0),coverage=hits.size/Math.max(1,samples().length);const searchScore=Math.min(1000,Math.round(good.reduce((s,p)=>s+SCORE_HIT*(p.headshot?HEADSHOT_BONUS:1),0)+coverage**.65*SCORE_COVERAGE));
   revealPacket={type:'reveal',revealId:crypto.randomUUID(),creature,points:clone(points),shots:clone(shots),arena:{w:W,h:H},searchScore};sendNet(revealPacket);go('reveal');$('#revealNote').textContent='已揭晓，等待对方确认';
 };
-cleanupNetwork=function(){sessionKey=null;connectionEpoch++;connectingSince=0;clearTimeout(reconnectTimer);reconnectTimer=0;networkPaused=false;connectionNotice.hidden=true;$('#shell').classList.remove('connection-paused');match=null;outgoing.clear();outgoingSeq=incomingSeq=0;partnerId=null;nextReady=peerReady=false;oldCleanup();updateMatchBanner()};
+cleanupNetwork=function(){if(sessionKey&&match)rawSend({protocol:2,kind:'peerLeaving'});sessionKey=null;connectionEpoch++;connectingSince=0;clearTimeout(reconnectTimer);reconnectTimer=0;networkPaused=false;connectionLostAt=0;partnerLeft=false;connectionNotice.hidden=true;$('#shell').classList.remove('connection-paused');$('#shell').inert=$('#lobby').inert=false;match=null;outgoing.clear();outgoingSeq=incomingSeq=0;partnerId=null;nextReady=peerReady=false;oldCleanup();updateMatchBanner()};
 $('#retryLink').onclick=()=>{clearTimeout(reconnectTimer);reconnectTimer=0;retryConnection()};$('#leaveLink').onclick=backToLobby;
-setInterval(()=>{if(!sessionKey)return;if(conn?.open){rawSend({protocol:2,kind:'ping'});if(Date.now()-receivedAt>10000)pauseConnection()}else pauseConnection()},2500);
-function recoverIfNeeded(){if(sessionKey&&(networkPaused||!conn?.open||Date.now()-receivedAt>10000)){pauseConnection();retryConnection()}}
+function checkConnection(){if(!sessionKey||!match)return;if(partnerLeft){renderConnectionNotice();return}if(navigator.onLine===false){pauseConnection();return}if(conn?.open){rawSend({protocol:2,kind:'ping'});if(Date.now()-receivedAt>=HEARTBEAT_TIMEOUT)pauseConnection()}else pauseConnection();if(networkPaused)renderConnectionNotice()}
+setInterval(checkConnection,2000);
+function recoverIfNeeded(){if(sessionKey&&(networkPaused||!conn?.open||Date.now()-receivedAt>=HEARTBEAT_TIMEOUT)){pauseConnection();retryConnection()}}
+addEventListener('offline',pauseConnection);
 addEventListener('online',recoverIfNeeded);document.addEventListener('visibilitychange',()=>{if(!document.hidden)recoverIfNeeded()});
 addEventListener('beforeunload',event=>{if(sessionKey&&match){event.preventDefault();event.returnValue=''}});
 $('#reset').onclick=()=>{if(netMode==='online')requestOnlineRestart();else{if(match)match=newMatch(match.mode);restart()}};
