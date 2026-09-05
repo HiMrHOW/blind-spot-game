@@ -2,6 +2,7 @@
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
+  <meta name="app-version" content="20260905-match-social-reconnect">
   <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
   <title>盲区 BLIND SPOT</title>
   <style>
@@ -188,6 +189,166 @@
     function useHint(){if(!shots.length){toast('先发射一枚彩弹，再扫描这一发');return}if(hints<=0){$('#modal').classList.remove('hidden');return}hints--;persist();const last=shots[shots.length-1],parts=[...new Set(last.parts||[])];if(!parts.length)toast('扫描结果：刚刚这一发没有命中生物');else{const shown=parts.slice(0,2).join('、'),more=parts.length>2?'等部位':'';toast(`扫描结果：刚刚命中 ${shown}${more}`)}panel()}
     function restart(){clearTimeout(revealTimer);revealPacket=null;revealAttempts=0;remoteAim=null;shots=[];hits=new Set();bonus=0;choose('human');go('setup')}function fullscreen(){document.documentElement.requestFullscreen?.().catch(()=>{})}
     $('#localMode').onclick=enterLocal;$('#createMode').onclick=()=>lobbyView('createBox');$('#joinMode').onclick=()=>lobbyView('joinBox');document.querySelectorAll('.backLobby').forEach(b=>b.onclick=backToLobby);$('#pickHider').onclick=()=>chooseRoomRole('hider');$('#pickGuesser').onclick=()=>chooseRoomRole('guesser');$('#createRoom').onclick=createOnlineRoom;$('#joinRoom').onclick=joinOnlineRoom;$('#roomInput').oninput=e=>e.target.value=e.target.value.replace(/\D/g,'').slice(0,6);$('#voice').onclick=toggleVoice;$('#reset').onclick=()=>netMode==='online'?requestOnlineRestart():restart();$('#acceptRestart').onclick=acceptOnlineRestart;$('#declineRestart').onclick=declineOnlineRestart;$('#exitLobby').onclick=backToLobby;$('#fullscreen').onclick=fullscreen;$('#cancelBuy').onclick=()=>$('#modal').classList.add('hidden');$('#confirmBuy').onclick=()=>{$('#modal').classList.add('hidden');buyHint()};portraitQuery.addEventListener?.('change',syncOrientation);choose('human');resources();go('setup');requestAnimationFrame(draw);
+    // This module is bundled inside the game's closure. No screen capture is used.
+const matchModes = {
+  quick: {label:'快速单局', rounds:1, desc:'一人藏、一人找，打完即结算。'},
+  duel: {label:'双轮对决', rounds:2, desc:'交换攻守各一次，累计得分定胜负。'},
+  series: {label:'六轮累计赛', rounds:6, desc:'三组攻守轮换，两人各藏三次、找三次。'}
+};
+let selectedMatchMode='duel', match=null, localSeat=0, nextReady=false, peerReady=false;
+let playerNames=['玩家 A','玩家 B'], networkPaused=false;
+let reconnectTimer=0, reconnectTries=0, partnerId=null, receivedAt=0, connectionEpoch=0;
+let connectingSince=0;
+let outgoingSeq=0, incomingSeq=0, outgoing=new Map(), sessionKey=null;
+let emoteMuted=false, sentEmoteAt=-Infinity, receivedEmoteAt=-Infinity, emoteTimer=0;
+const emotes=['😏 就这点准头？','😎 你确定往这打？','👀 我可看着呢','🎯 下一发见真章','😂 心态要稳！','👏 这发漂亮！'];
+const oldPanel=panel, oldGo=go, oldReceive=receiveNet, oldCleanup=cleanupNetwork;
+const oldEnterGame=enterGame, oldRoleRoom=enterRoleRoom, oldLocal=enterLocal;
+const oldLobbyView=lobbyView;
+const featureStyle=document.createElement('style');
+featureStyle.textContent=`
+  .match-options{display:grid;gap:9px}.match-options label{display:grid;gap:5px;font-size:12px;font-weight:900}
+  .match-options input,.match-options select{width:100%;min-height:44px;padding:8px;border:2px solid #111;background:white;color:#111;font:inherit}
+  #matchBanner{display:none;grid-column:1/-1;font-size:12px;font-weight:900;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .shell.in-match .top{height:88px;flex-basis:88px;grid-template-rows:58px 26px}.shell.in-match .stage{height:calc(100svh - 88px)}
+  .shell.in-match #matchBanner{display:block}.shell.in-match .topright{grid-row:1}
+  .stage-note{font-size:11px;line-height:1.5}.pose-actions{display:flex;gap:6px;align-items:center;flex-wrap:wrap}.pose-actions button{min-height:44px}
+  #emoteDock{position:absolute;z-index:9;right:10px;top:10px}#emoteToggle{min-height:44px;min-width:54px;background:#fff;border:2px solid #111;font-weight:900}
+  #emoteMenu{display:grid;gap:5px;width:200px;padding:8px;background:#fff;border:2px solid #111;box-shadow:4px 4px #111}#emoteMenu[hidden]{display:none}
+  #emoteMenu button{min-height:44px;background:#fff;border:1px solid #111;text-align:left;font-size:13px}
+  #emoteBubble{position:absolute;z-index:10;left:12px;bottom:12px;max-width:80%;padding:10px;background:#fff5cf;border:2px solid #111;pointer-events:none;font-weight:900}
+  #emoteBubble[hidden],#emoteDock[hidden],#connectionNotice[hidden]{display:none}
+  #connectionNotice{position:fixed;z-index:90;inset:0;background:#f3f1ecf5;display:grid;place-items:center;padding:24px;text-align:center}
+  #connectionNotice>div{max-width:420px}#connectionNotice h2{font-size:28px}#connectionNotice button{margin:8px;min-height:44px}
+  .connection-paused .board canvas{pointer-events:none}
+  @media(orientation:portrait){.shell.in-match .top{height:88px;flex-basis:88px;grid-template-rows:58px 26px}#matchBanner{font-size:11px}
+  .panel[data-phase='pose'] .pose-actions{grid-column:1/-1}.panel[data-phase='pose']{gap:3px}.panel[data-phase='pose'] .meterbox{display:none}
+  .panel[data-phase='reveal']{grid-template-columns:1fr}.panel[data-phase='reveal'] .stage-note{font-size:11px}#emoteMenu{max-width:65vw}}
+`;
+document.head.append(featureStyle);
+const matchBanner=document.createElement('div');matchBanner.id='matchBanner';$('.top').append(matchBanner);
+const connectionNotice=document.createElement('div');connectionNotice.id='connectionNotice';connectionNotice.hidden=true;
+connectionNotice.innerHTML='<div><h2>正在恢复连接</h2><p id="reconnectText">进度已经保留，请保持页面开启。</p><button class="primary" id="retryLink">立即重试</button><button class="secondary" id="leaveLink">离开房间</button></div>';
+document.body.append(connectionNotice);
+const emoteDock=document.createElement('div');emoteDock.id='emoteDock';emoteDock.hidden=true;
+emoteDock.innerHTML='<button id="emoteToggle" aria-expanded="false">😏 互动</button><div id="emoteMenu" hidden></div>';
+$('.board').append(emoteDock);
+const emoteBubble=document.createElement('div');emoteBubble.id='emoteBubble';emoteBubble.hidden=true;$('.board').append(emoteBubble);
+emotes.forEach((text,index)=>{const b=document.createElement('button');b.textContent=text;b.onclick=()=>sendEmote(index);$('#emoteMenu').append(b)});
+const muteEmotes=document.createElement('button');muteEmotes.textContent='屏蔽对方表情：关';$('#emoteMenu').append(muteEmotes);
+muteEmotes.onclick=()=>{emoteMuted=!emoteMuted;muteEmotes.textContent=`屏蔽对方表情：${emoteMuted?'开':'关'}`;emoteBubble.hidden=true};
+$('#emoteToggle').onclick=()=>{const menu=$('#emoteMenu');menu.hidden=!menu.hidden;$('#emoteToggle').setAttribute('aria-expanded',String(!menu.hidden))};
+function showEmote(index,own=false){if(!emotes[index]||(!own&&emoteMuted))return;emoteBubble.textContent=`${own?'你':playerNames[1-localSeat]}：${emotes[index]}`;emoteBubble.hidden=false;clearTimeout(emoteTimer);emoteTimer=setTimeout(()=>emoteBubble.hidden=true,2600)}
+function sendEmote(index){if(netMode!=='online'||networkPaused)return;if(performance.now()-sentEmoteAt<4000){toast('稍等一下，4 秒后再发');return}sentEmoteAt=performance.now();sendNet({type:'emote',index});showEmote(index,true);$('#emoteMenu').hidden=true;$('#emoteToggle').setAttribute('aria-expanded','false')}
+function safeName(name,fallback){return typeof name==='string'?name.trim().slice(0,12)||fallback:fallback}
+function addModeForm(box,local=false){const section=document.createElement('div');section.className='match-options';
+  section.innerHTML='<label>你的昵称<input maxlength="12" class="player-name" placeholder="玩家 A"></label>'+(local?'<label>另一位玩家<input maxlength="12" class="other-name" placeholder="玩家 B"></label>':'')+'<label>比赛方式<select class="match-mode"></select></label><p class="stage-note mode-description"></p>';
+  Object.entries(matchModes).forEach(([id,m])=>{const option=document.createElement('option');option.value=id;option.textContent=m.label;section.querySelector('select').append(option)});
+  section.querySelector('select').value=selectedMatchMode;
+  const update=()=>{selectedMatchMode=section.querySelector('select').value;section.querySelector('.mode-description').textContent=matchModes[selectedMatchMode].desc};section.querySelector('select').onchange=update;update();
+  box.insertBefore(section,box.querySelector('.primary'));return section;
+}
+const localBox=document.createElement('div');localBox.id='localMatchBox';localBox.className='lobbybox hidden';
+localBox.innerHTML='<button class="subclose" aria-label="关闭并返回大厅">×</button><p class="eyebrow">同屏轮流玩</p><h2>选好赛制，再开一局</h2><button class="primary" id="startLocalMatch">开始比赛</button><button class="link">返回大厅</button>';
+$('#createBox').parentElement.append(localBox);
+const localForm=addModeForm(localBox,true), hostForm=addModeForm($('#createBox'));
+const roomMatchNote=document.createElement('p');roomMatchNote.className='actionnote';$('#roleRoomBox').insertBefore(roomMatchNote,$('#roleRoomBox .rolepick'));
+const guestLabel=document.createElement('label');guestLabel.className='match-options';guestLabel.textContent='你的昵称';
+const guestName=document.createElement('input');guestName.maxLength=12;guestName.placeholder='玩家 B';guestLabel.append(guestName);$('#joinBox').insertBefore(guestLabel,$('#roomInput'));
+localBox.querySelector('.subclose').onclick=()=>lobbyView(null);localBox.querySelector('.link').onclick=()=>lobbyView(null);
+lobbyView=function(id){oldLobbyView(id);localBox.classList.toggle('hidden',id!=='localMatchBox')};
+function newMatch(mode=selectedMatchMode,id=crypto.randomUUID()){return{id,mode:matchModes[mode]?mode:'duel',round:1,hider:0,scores:[0,0],results:{}}}
+function startLocalMatch(){selectedMatchMode=localForm.querySelector('select').value;playerNames=[safeName(localForm.querySelector('.player-name').value,'玩家 A'),safeName(localForm.querySelector('.other-name').value,'玩家 B')];oldLocal();match=newMatch();panel()}
+function updateMatchBanner(){if(match)roomMatchNote.textContent=`${playerNames[0]} × ${playerNames[1]} · ${matchModes[match.mode].label}。${matchModes[match.mode].desc}`;const active=!!match&&['local','online'].includes(netMode);$('#shell').classList.toggle('in-match',active);if(!active)return;matchBanner.textContent=`${matchModes[match.mode].label} · 第 ${match.round}/${matchModes[match.mode].rounds} 轮 · ${playerNames[0]} ${match.scores[0]} : ${match.scores[1]} ${playerNames[1]}`}
+function matchOver(){return match&&match.round>=matchModes[match.mode].rounds}
+function recordResult(score){if(!match||match.results[match.round]!==undefined)return;const b=Math.max(0,Math.min(1000,Math.round(score)));match.results[match.round]=b;match.scores[match.hider]+=1000-b;match.scores[1-match.hider]+=b;updateMatchBanner()}
+function finishText(){if(!matchOver())return `下一轮交换攻守：${playerNames[1-match.hider]}藏，${playerNames[match.hider]}找。`;return match.scores[0]===match.scores[1]?'总分打平，旗鼓相当！':`${playerNames[match.scores[0]>match.scores[1]?0:1]} 赢下${matchModes[match.mode].label}！`}
+function advanceRound(){nextReady=peerReady=false;if(!match)return;if(matchOver()){match=newMatch(match.mode,match.id+':next');if(netMode==='online'){oldRoleRoom();updateMatchBanner();return}}else{match.round++;match.hider=1-match.hider}if(netMode==='online')enterGame(match.hider===localSeat?'hider':'guesser');else restart();updateMatchBanner()}
+function nextMatchRound(){if(netMode==='local'){advanceRound();return}if(networkPaused)return;nextReady=true;sendNet({type:'roundReady',matchId:match.id,round:match.round});panel();if(peerReady)advanceRound()}
+enterGame=function(role){if(match&&match.round===1&&Object.keys(match.results).length===0)match.hider=role==='hider'?localSeat:1-localSeat;oldEnterGame(role);updateMatchBanner()};
+enterRoleRoom=function(){if(netMode==='online'&&match)match=newMatch(match.mode,match.id+':restart');nextReady=peerReady=false;oldRoleRoom();updateMatchBanner()};
+function randomPose(){if(phase!=='pose')return;cancelAnimationFrame(jiggle);const savedPoints=clone(points);let accepted=false;
+  for(let attempt=0;attempt<16;attempt++){points=clone(savedPoints);const center=Object.values(points).reduce((a,p)=>({x:a.x+p.x/Object.keys(points).length,y:a.y+p.y/Object.keys(points).length}),{x:0,y:0});const angle=(Math.random()-.5)*Math.PI*1.7;
+    Object.values(points).forEach(p=>{const x=p.x-center.x,y=p.y-center.y;p.x=center.x+x*Math.cos(angle)-y*Math.sin(angle);p.y=center.y+x*Math.sin(angle)+y*Math.cos(angle)});
+    points=mapArena(points,[],W,H,W,H,true).points;
+    const handles=(def().handles||Object.keys(points)).filter(k=>/elbow|wrist|knee|ankle|paw|tailTip|wingTip/i.test(k));
+    for(let n=0;n<3&&handles.length;n++){const k=handles[Math.floor(Math.random()*handles.length)];points=solve(points,k,{x:Math.max(60,Math.min(W-60,points[k].x+(Math.random()-.5)*100)),y:Math.max(60,Math.min(H-60,points[k].y+(Math.random()-.5)*100))})}
+    if(overlaps()<=2&&def().constraints.every(c=>{const d=distance(points[c.a],points[c.b]);return d>=c.rest*c.min-3&&d<=c.rest*c.max+3})){accepted=true;break}
+  }if(!accepted)points=savedPoints;panel();draw();toast(accepted?'换个姿势！还可以继续拖动调整':'保留当前姿势，再试一次或自己调整')
+}
+panel=function(){oldPanel();updateMatchBanner();emoteDock.hidden=netMode!=='online'||!['shoot','netwait','reveal'].includes(phase);if(emoteDock.hidden){$('#emoteMenu').hidden=true;emoteBubble.hidden=true}
+  if(match){const title=$('#panel .eyebrow');if(title&&['setup','pose'].includes(phase))title.textContent=`${playerNames[match.hider]} · 藏匿方 · ${phase==='setup'?'选择生物':'摆姿势'}`;if(title&&['loadout','shoot'].includes(phase))title.textContent=`${playerNames[1-match.hider]} · 寻找方 · ${def().label}`}
+  if(phase==='pose'){const row=document.createElement('div');row.className='pose-actions';const b=document.createElement('button');b.className='secondary';b.textContent='🎲 随机姿势';b.onclick=randomPose;row.append(b);$('#panel').insertBefore(row,$('#lock'))}
+  if(phase==='handoff'&&match){$('#panel h2').textContent=`请交给${playerNames[1-match.hider]}`}
+  if(phase==='reveal'&&match){const note=$('#panel .mobilehelp');if(note)note.textContent=finishText();$('#panel h2').textContent=matchOver()?'比赛结束':'本轮结束，准备换边';const b=$('#again');b.textContent=nextReady?'已准备，等对方':matchOver()?'再来一场':`准备第 ${match.round+1} 轮 · 交换攻守`;b.disabled=nextReady;b.onclick=nextMatchRound;
+    const labels=$('#result').querySelectorAll('.score span');labels[0].textContent=`${playerNames[1-match.hider]} · 找`;labels[1].textContent=`${playerNames[match.hider]} · 藏`;
+    $('#summary').textContent=finishText();
+  }
+};
+go=function(next){oldGo(next);if(next==='reveal'){recordResult(Number($('#scoreB').textContent));panel()}if(next==='shoot'&&netMode==='online')sendNet({type:'shootStarted'})};
+
+// Reliable events are replayed after reconnect and applied once in sequence.
+function rawSend(message){if(conn?.open)try{conn.send(message)}catch{pauseConnection()}}
+sendNet=function(data){if(netMode!=='online'&&netMode!=='room'&&!conn)return;if(['aim','emote'].includes(data.type)){rawSend({protocol:2,kind:'ephemeral',data});return}const packet={protocol:2,kind:'event',seq:++outgoingSeq,data};outgoing.set(packet.seq,packet);rawSend(packet)};
+function pauseConnection(){if(!sessionKey)return;networkPaused=true;connectionNotice.hidden=false;$('#shell').classList.add('connection-paused');clearTimeout(revealTimer);scheduleReconnect()}
+function unpauseConnection(){networkPaused=false;connectionNotice.hidden=true;$('#shell').classList.remove('connection-paused');reconnectTries=0;clearTimeout(reconnectTimer);reconnectTimer=0;if(voiceReady)sendNet({type:'voiceReady'})}
+function scheduleReconnect(){if(reconnectTimer||!sessionKey)return;reconnectTimer=setTimeout(()=>{reconnectTimer=0;retryConnection()},3000)}
+function retryConnection(){if(!sessionKey)return;reconnectTries++;$('#reconnectText').textContent=`进度已保留，正在尝试重连（${reconnectTries}）。请两位玩家回到游戏页面。`;
+  if(peer?.disconnected)try{peer.reconnect()}catch{}
+  if(conn?.open&&Date.now()-receivedAt<10000){rawSend({protocol:2,kind:'hello',sessionKey});rawSend({protocol:2,kind:'ping'})}
+  else if(!isHost&&peer?.open&&(!connectingSince||Date.now()-connectingSince>12000)){const c=peer.connect(`blindspot-${roomCode}`,{reliable:true,metadata:{sessionKey}});wireConnection(c)}scheduleReconnect()
+}
+function deliverPacket(packet){if(!packet||packet.protocol!==2)return;receivedAt=Date.now();
+  if(packet.kind==='hello'){if(isHost&&packet.sessionKey!==sessionKey)return;unpauseConnection();rawSend({protocol:2,kind:'ack',seq:incomingSeq});for(const event of outgoing.values())rawSend(event);return}
+  if(packet.kind==='ping'){rawSend({protocol:2,kind:'pong'});return}if(packet.kind==='pong'){if(networkPaused){unpauseConnection();for(const event of outgoing.values())rawSend(event)}return}
+  if(packet.kind==='ack'){for(const seq of outgoing.keys())if(seq<=packet.seq)outgoing.delete(seq);return}
+  if(packet.kind==='ephemeral'){receiveNet(packet.data);return}
+  if(packet.kind!=='event'||!Number.isInteger(packet.seq))return;
+  if(packet.seq===incomingSeq+1){receiveNet(packet.data);incomingSeq=packet.seq}
+  rawSend({protocol:2,kind:'ack',seq:incomingSeq});
+}
+wireConnection=function(c){const previous=conn,epoch=++connectionEpoch;conn=c;connectingSince=Date.now();
+  c.on('data',packet=>{if(epoch===connectionEpoch)deliverPacket(packet)});
+  c.on('open',()=>{if(epoch!==connectionEpoch){c.close();return}connectingSince=0;receivedAt=Date.now();if(previous&&previous!==c)previous.close();
+    rawSend({protocol:2,kind:'hello',sessionKey});for(const event of outgoing.values())rawSend(event);
+    if(isHost&&!match){match=newMatch();localSeat=0;sendNet({type:'matchWelcome',sessionKey,match:clone(match),names:playerNames,roomCode});oldRoleRoom();updateMatchBanner()}
+    if(networkPaused)unpauseConnection();
+  });c.on('close',()=>{if(epoch===connectionEpoch){connectingSince=0;pauseConnection()}});c.on('error',()=>{if(epoch===connectionEpoch){connectingSince=0;pauseConnection()}});
+};
+const oldInitPeer=initPeer;
+initPeer=function(id,onOpen,onError){oldInitPeer(id,onOpen,onError);peer.on('disconnected',()=>{if(sessionKey){try{peer.reconnect()}catch{}pauseConnection()}})};
+createOnlineRoom=function(){playerNames=[safeName(hostForm.querySelector('.player-name').value,'玩家 A'),'玩家 B'];selectedMatchMode=hostForm.querySelector('select').value;isHost=true;localSeat=0;sessionKey=crypto.randomUUID();roomCode=String(Math.floor(100000+Math.random()*900000));$('#lobbyRoomCode').textContent=roomCode;$('#lobbyStatus').textContent='正在建立房间…';lobbyView('waitingBox');
+  initPeer(`blindspot-${roomCode}`,()=>{$('#lobbyStatus').textContent=`${matchModes[selectedMatchMode].label} · 等待朋友加入`;peer.on('connection',c=>{if(partnerId&&c.peer!==partnerId){c.close();return}if(match&&c.metadata?.sessionKey!==sessionKey){c.close();return}partnerId=c.peer;wireConnection(c)})},message=>$('#lobbyStatus').textContent=message)
+};
+joinOnlineRoom=function(){const code=$('#roomInput').value.trim();if(!/^\d{6}$/.test(code)){$('#joinStatus').textContent='请输入六位房间号';return}roomCode=code;localSeat=1;isHost=false;playerNames[1]=safeName(guestName.value,'玩家 B');$('#joinStatus').textContent='正在加入…';initPeer(`blindspot-guest-${crypto.randomUUID()}`,()=>{wireConnection(peer.connect(`blindspot-${roomCode}`,{reliable:true}));setTimeout(()=>{if(!sessionKey)$('#joinStatus').textContent='还未连接成功，请检查号码后返回重试'},10000)},message=>$('#joinStatus').textContent=message)};
+receiveNet=function(data){if(!data||typeof data!=='object')return;
+  if(data.type==='matchWelcome'&&!isHost){sessionKey=data.sessionKey;match=data.match;playerNames[0]=safeName(data.names?.[0],'玩家 A');roomCode=data.roomCode;sendNet({type:'playerName',name:playerNames[1]});oldRoleRoom();updateMatchBanner();return}
+  if(data.type==='playerName'){playerNames[1-localSeat]=safeName(data.name,'朋友');updateMatchBanner();return}
+  if(data.type==='emote'){if(Number.isInteger(data.index)&&performance.now()-receivedEmoteAt>=3500){receivedEmoteAt=performance.now();showEmote(data.index)}return}
+  if(data.type==='shootStarted'&&netRole==='hider'){$('#netWaitTitle').textContent='对方开始寻找了';$('#netWaitText').textContent='想逗逗对方？右上角可以发表情。';return}
+  if(data.type==='roundReady'){if(match&&data.matchId===match.id&&data.round===match.round&&phase==='reveal'){peerReady=true;if(nextReady)advanceRound();else toast('对方已准备好，点底部按钮继续')}return}
+  if(data.type==='roleChoice'&&netMode!=='room')return;
+  // Use the shooter's score for both clients to avoid orientation-dependent totals.
+  oldReceive(data);
+  if(data.type==='shotProgress'&&netRole==='hider'&&!emoteMuted)$('#netWaitText').textContent=`已看到 ${data.count}/${BULLETS} 发 · ${data.shot?.gain>0?'这发有点东西，回个表情？':'对方还在试探，点「互动」逗逗 TA？'}`;
+  if(data.type==='reveal'&&netRole==='hider'&&match){if(Number.isFinite(data.searchScore)){const previous=match.results[match.round];if(previous!==undefined){match.scores[match.hider]-=1000-previous;match.scores[1-match.hider]-=previous;delete match.results[match.round]}recordResult(data.searchScore);$('#scoreB').textContent=data.searchScore;$('#scoreA').textContent=1000-data.searchScore}panel()}
+};
+revealOnline=function(){const good=shots.filter(s=>s.gain>0),coverage=hits.size/Math.max(1,samples().length);const searchScore=Math.min(1000,Math.round(good.reduce((s,p)=>s+SCORE_HIT*(p.headshot?HEADSHOT_BONUS:1),0)+coverage**.65*SCORE_COVERAGE));
+  revealPacket={type:'reveal',revealId:crypto.randomUUID(),creature,points:clone(points),shots:clone(shots),arena:{w:W,h:H},searchScore};sendNet(revealPacket);go('reveal');$('#revealNote').textContent='已揭晓，等待对方确认';
+};
+cleanupNetwork=function(){sessionKey=null;connectionEpoch++;connectingSince=0;clearTimeout(reconnectTimer);reconnectTimer=0;networkPaused=false;connectionNotice.hidden=true;$('#shell').classList.remove('connection-paused');match=null;outgoing.clear();outgoingSeq=incomingSeq=0;partnerId=null;nextReady=peerReady=false;oldCleanup();updateMatchBanner()};
+$('#retryLink').onclick=()=>{clearTimeout(reconnectTimer);reconnectTimer=0;retryConnection()};$('#leaveLink').onclick=backToLobby;
+setInterval(()=>{if(!sessionKey)return;if(conn?.open){rawSend({protocol:2,kind:'ping'});if(Date.now()-receivedAt>10000)pauseConnection()}else pauseConnection()},2500);
+function recoverIfNeeded(){if(sessionKey&&(networkPaused||!conn?.open||Date.now()-receivedAt>10000)){pauseConnection();retryConnection()}}
+addEventListener('online',recoverIfNeeded);document.addEventListener('visibilitychange',()=>{if(!document.hidden)recoverIfNeeded()});
+addEventListener('beforeunload',event=>{if(sessionKey&&match){event.preventDefault();event.returnValue=''}});
+$('#reset').onclick=()=>{if(netMode==='online')requestOnlineRestart();else{if(match)match=newMatch(match.mode);restart()}};
+$('#localMode').onclick=()=>lobbyView('localMatchBox');$('#startLocalMatch').onclick=startLocalMatch;
+$('#createRoom').onclick=createOnlineRoom;$('#joinRoom').onclick=joinOnlineRoom;
+// Rebind handlers captured before this module was installed.
+document.querySelectorAll('.backLobby').forEach(b=>b.onclick=backToLobby);$('#exitLobby').onclick=backToLobby;
+panel();
+
   })();
   </script>
 </body>
