@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
-  <meta name="app-version" content="20260905-disconnect-notice">
+  <meta name="app-version" content="20260905-fair-invite-tutorial">
   <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
   <title>盲区 BLIND SPOT</title>
   <style>
@@ -172,6 +172,7 @@
         body.forEach((q,i)=>{if(distance(q,p)<=RADIUS+def().lineWidth/2){next.add(i);touched.add(q.part)}});
         const count=next.size-hits.size,gain=Math.round(count/body.length*1000),headshot=count>0&&touched.has('头部'),overlapNote=closest<=RADIUS*.35?'同一位置｜不会重复加分':closest<RADIUS*2?'彩弹部分重叠｜只计算新覆盖':'',shot={...p,gain,headshot,parts:[...touched],color:['#ff4f36','#2c59ff','#f7bb16','#e9348a'][shots.length%4]};
         shots.push(shot);hits=next;bonus+=headshot?count*.5:0;
+        if(typeof shotFeedback==='function')shotFeedback(count>0,e.pointerType==='touch');
         if(netMode==='online')sendNet({type:'shotProgress',count:shots.length,shot:{x:shot.x/W,y:shot.y/H,gain:shot.gain,headshot:shot.headshot,color:shot.color}});
         if(overlapNote)toast(overlapNote);panel();draw();
       }
@@ -328,9 +329,9 @@ wireConnection=function(c){const previous=conn,epoch=++connectionEpoch;conn=c;co
 const oldInitPeer=initPeer;
 initPeer=function(id,onOpen,onError){oldInitPeer(id,onOpen,onError);peer.on('disconnected',()=>{if(sessionKey){try{peer.reconnect()}catch{}if(!conn?.open)pauseConnection()}})};
 createOnlineRoom=function(){playerNames=[safeName(hostForm.querySelector('.player-name').value,'玩家 A'),'玩家 B'];selectedMatchMode=hostForm.querySelector('select').value;isHost=true;localSeat=0;sessionKey=crypto.randomUUID();roomCode=String(Math.floor(100000+Math.random()*900000));$('#lobbyRoomCode').textContent=roomCode;$('#lobbyStatus').textContent='正在建立房间…';lobbyView('waitingBox');
-  initPeer(`blindspot-${roomCode}`,()=>{$('#lobbyStatus').textContent=`${matchModes[selectedMatchMode].label} · 等待朋友加入`;peer.on('connection',c=>{if(partnerId&&c.peer!==partnerId){c.close();return}if(match&&c.metadata?.sessionKey!==sessionKey){c.close();return}partnerId=c.peer;wireConnection(c)})},message=>$('#lobbyStatus').textContent=message)
+  initPeer(`blindspot-${roomCode}`,()=>{$('#lobbyStatus').textContent=`${matchModes[selectedMatchMode].label} · 等待朋友加入`;peer.on('connection',c=>{if(partnerId&&match&&c.peer!==partnerId){c.close();return}if(match&&c.metadata?.sessionKey!==sessionKey){c.close();return}partnerId=c.peer;wireConnection(c)})},message=>$('#lobbyStatus').textContent=message)
 };
-joinOnlineRoom=function(){const code=$('#roomInput').value.trim();if(!/^\d{6}$/.test(code)){$('#joinStatus').textContent='请输入六位房间号';return}roomCode=code;localSeat=1;isHost=false;playerNames[1]=safeName(guestName.value,'玩家 B');$('#joinStatus').textContent='正在加入…';initPeer(`blindspot-guest-${crypto.randomUUID()}`,()=>{wireConnection(peer.connect(`blindspot-${roomCode}`,{reliable:true}));setTimeout(()=>{if(!sessionKey)$('#joinStatus').textContent='还未连接成功，请检查号码后返回重试'},10000)},message=>$('#joinStatus').textContent=message)};
+joinOnlineRoom=function(){const code=$('#roomInput').value.trim();if(!/^\d{6}$/.test(code)){$('#joinStatus').textContent='请输入六位房间号';return}if(!sessionKey){connectionEpoch++;conn?.close?.();peer?.destroy?.();conn=peer=null}roomCode=code;localSeat=1;isHost=false;playerNames[1]=safeName(guestName.value,'玩家 B');$('#joinStatus').textContent='正在加入…';initPeer(`blindspot-guest-${crypto.randomUUID()}`,()=>{wireConnection(peer.connect(`blindspot-${roomCode}`,{reliable:true}));setTimeout(()=>{if(!sessionKey)$('#joinStatus').textContent='连接尚未完成。请双方保持页面开启；若一直无法加入，可换个网络后重试。'},10000)},message=>$('#joinStatus').textContent=message)};
 receiveNet=function(data){if(!data||typeof data!=='object')return;
   if(data.type==='matchWelcome'&&!isHost){sessionKey=data.sessionKey;match=data.match;playerNames[0]=safeName(data.names?.[0],'玩家 A');roomCode=data.roomCode;sendNet({type:'playerName',name:playerNames[1]});oldRoleRoom();updateMatchBanner();return}
   if(data.type==='playerName'){playerNames[1-localSeat]=safeName(data.name,'朋友');updateMatchBanner();return}
@@ -360,6 +361,105 @@ $('#createRoom').onclick=createOnlineRoom;$('#joinRoom').onclick=joinOnlineRoom;
 // Rebind handlers captured before this module was installed.
 document.querySelectorAll('.backLobby').forEach(b=>b.onclick=backToLobby);$('#exitLobby').onclick=backToLobby;
 panel();
+
+// Fair rules are carried in the shared match, separate from saved resources.
+const FAIR_SCANS=2;
+let selectedFair=true, fairScanRound='', fairScans=FAIR_SCANS;
+const coreNewMatch=newMatch, coreChoose=choose, corePanel=panel, coreGo=go;
+const coreReceive=receiveNet, coreUseHint=useHint, coreBuyHint=buyHint;
+const coreStartLocal=startLocalMatch, coreCreateRoom=createOnlineRoom, coreCleanup=cleanupNetwork;
+function isFair(){return !!match?.fair}
+function pairedCreature(){let hash=0;const seed=match.id+':'+Math.floor((match.round-1)/2);for(const char of seed)hash=(Math.imul(hash,31)+char.charCodeAt(0))|0;return ['human','cat','bird'][(hash>>>0)%3]}
+function ruleText(){return isFair()?`公平局 · 本组${creatures[pairedCreature()].label} · ${BULLETS} 发 / ${FAIR_SCANS} 次扫描`:'娱乐局 · 自由选择生物和扫描'}
+function addRules(form){const label=document.createElement('label');label.textContent='对局规则';const select=document.createElement('select');select.className='fair-rule';select.innerHTML='<option value="fair">公平局 · 每组同生物、8 发、2 次扫描</option><option value="free">娱乐局 · 自由选生物、自由兑换扫描</option>';select.value='fair';label.append(select);form.append(label)}
+addRules(localForm);addRules(hostForm);
+newMatch=function(mode,id){const result=coreNewMatch(mode,id);result.fair=selectedFair;return result};
+startLocalMatch=function(){selectedFair=localForm.querySelector('.fair-rule').value==='fair';coreStartLocal();choose(isFair()?pairedCreature():'human')};
+createOnlineRoom=function(){selectedFair=hostForm.querySelector('.fair-rule').value==='fair';coreCreateRoom()};
+choose=function(id){coreChoose(isFair()?pairedCreature():id)};
+function resetFairScans(){const key=match?match.id+':'+match.round:'';if(key!==fairScanRound){fairScanRound=key;fairScans=FAIR_SCANS}}
+function scanDescription(last){const parts=[...new Set(last.parts||[])];return parts.length?`扫描结果：刚刚命中 ${parts.slice(0,2).join('、')}${parts.length>2?'等部位':''}`:'扫描结果：刚刚这一发没有命中生物'}
+useHint=function(){if(!isFair())return coreUseHint();if(phase!=='shoot'||networkPaused)return;if(!shots.length){toast('先发射一枚彩弹，再扫描这一发');return}if(fairScans<=0){toast('本轮 2 次扫描已用完，下轮重新分配');return}fairScans--;toast(scanDescription(shots[shots.length-1]));panel()};
+buyHint=function(){if(isFair()){toast('公平局每轮提供 2 次扫描，双方额度相同');return}coreBuyHint()};
+go=function(next){if(next==='loadout'){resetFairScans();$('#modal').classList.add('hidden')}coreGo(next)};
+panel=function(){corePanel();if(match){roomMatchNote.textContent+=` ${ruleText()}`;matchBanner.title=ruleText()}
+  if(!isFair())return;
+  if(phase==='setup'){
+    const title=$('#panel h2');title.textContent=`本组统一使用${creatures[pairedCreature()].label}`;
+    $('#panel .creatures').hidden=true;$('#panel .creatures').style.display='none';
+    $('#panel .selected').innerHTML='<p class="eyebrow">公平局</p><strong>每组攻守条件一致</strong><p>双方各自摆姿势。交换攻守后，生物相同；每人均有 8 发、2 次扫描。</p>';
+    $('#panel .mobilehelp').textContent='双方本组同生物 · 每轮 8 发 / 2 次扫描';
+    const intro=$('#panel h2').parentElement.querySelector('p:not(.eyebrow)');if(intro)intro.textContent='本组生物由系统选定，交换攻守后保持相同。姿势由你自由调整。';
+  }
+  if(phase==='loadout'){
+    $('#panel h2').textContent='你的公平局装备已就绪';$('#panel .mobilehelp').textContent='本轮 8 发、2 次扫描；不会消耗库存';
+    $('#panel .shop').innerHTML='<strong>8 发彩弹 · 2 次扫描</strong><p>每轮重新分配，不能额外购买。</p>';
+    const buy=$('#buy');buy.hidden=true;buy.style.display='none';buy.parentElement.style.gridTemplateColumns='1fr';$('#beginShoot').textContent='准备好了，开始射击';
+    const intro=$('#panel h2').parentElement.querySelector('p:not(.eyebrow):not(.mobilehelp)');if(intro)intro.textContent='双方使用同一种生物、相同弹药和扫描次数。扫描只告诉你上一发碰到了哪个部位。';
+  }
+  if(phase==='shoot'){$('#useHint').textContent=`扫描上一发（剩 ${fairScans}）`;$('#useHint').disabled=fairScans<=0}
+};
+receiveNet=function(data){if(data?.type==='matchWelcome'&&!isHost)selectedFair=data.match?.fair===true;coreReceive(data);if(data?.type==='matchWelcome'||data?.type==='playerName'){if(match)roomMatchNote.textContent=`${playerNames.join(' × ')} · ${matchModes[match.mode].label}。${ruleText()}`}};
+cleanupNetwork=function(){fairScanRound='';fairScans=FAIR_SCANS;coreCleanup()};
+
+// Only the public room code is shared, never the reconnect credential or pose.
+const invitation=document.createElement('div');invitation.className='invite-actions';
+invitation.innerHTML='<button class="primary" id="shareRoom">分享邀请链接</button><button class="secondary" id="copyRoom">复制邀请链接</button><input id="inviteFallback" aria-label="邀请链接，长按复制" readonly hidden><p id="inviteStatus" role="status"></p>';
+$('#waitingBox').insertBefore(invitation,$('#waitingBox .backLobby:not(.subclose)'));
+function inviteLink(code=roomCode){return /^\d{6}$/.test(code)?`https://himrhow.github.io/blind-spot-game/?room=${code}&v=20260905-fair-invite-tutorial`:null}
+async function copyInvite(){const url=inviteLink();if(!url||!peer?.open){$('#inviteStatus').textContent='房间还在连接，请稍等片刻';return}try{if(!navigator.clipboard?.writeText)throw Error();await navigator.clipboard.writeText(url);$('#inviteStatus').textContent='邀请链接已复制，发给朋友即可'}catch{const input=$('#inviteFallback');input.hidden=false;input.value=url;input.focus();input.select();$('#inviteStatus').textContent='请长按或选中上面的邀请链接复制'}}
+$('#copyRoom').onclick=copyInvite;
+$('#shareRoom').onclick=async()=>{const url=inviteLink();if(!url||!peer?.open){$('#inviteStatus').textContent='房间还在连接，请稍等片刻';return}if(!navigator.share)return copyInvite();try{await navigator.share({title:'来玩一局盲区',text:'一个人藏，一个人找。点链接加入我的房间！',url});$('#inviteStatus').textContent='已打开分享，请等待朋友加入'}catch(error){if(error.name!=='AbortError')await copyInvite()}};
+
+// Audio encodes only new-hit / no-new-hit, never headshots or body parts.
+let audioContext=null, soundOn=true, vibrationOn=true;
+try{const prefs=JSON.parse(localStorage.getItem('blindSpotFeedback')||'{}');soundOn=prefs.sound!==false;vibrationOn=prefs.vibration!==false}catch{}
+const extrasStyle=document.createElement('style');extrasStyle.textContent=`
+.invite-actions{display:grid;gap:12px}.invite-actions input{width:100%;min-height:44px;font-size:14px}.invite-actions p{font-size:14px;margin:0}
+.lobby-tools{display:flex;gap:8px;flex-wrap:wrap;margin-top:16px}.lobby-tools button{background:white;border:2px solid #111;min-height:44px;padding:8px 12px;font:inherit;font-size:14px;font-weight:700}
+.lobby.subview .lobby-tools{display:none}.shot-kick{position:absolute;right:14px;bottom:14px;pointer-events:none;font-size:28px;color:#222;opacity:0;z-index:8}.shot-kick.fire{animation:shotkick 170ms ease-out}@keyframes shotkick{0%{opacity:1;transform:translateY(4px) scale(1.1)}60%{opacity:.7;transform:translateY(-6px)}100%{opacity:0;transform:translateY(0)}}
+#tutorialScreen{position:fixed;inset:0;z-index:85;background:#f3f1ec;display:grid;grid-template-rows:auto minmax(0,1fr) auto;padding:max(18px,env(safe-area-inset-top)) 20px max(20px,env(safe-area-inset-bottom));gap:14px}#tutorialScreen[hidden]{display:none}#tutorialScreen header{display:flex;justify-content:space-between;align-items:center;gap:10px}#tutorialScreen h2{font-size:26px;margin:0}#tutorialScreen p{font-size:16px;line-height:1.5;margin:8px 0}#tutorialScreen button{min-height:48px;font-size:16px}#tutorialScreen .tutorial-body{width:min(600px,100%);justify-self:center;overflow:auto;min-height:0}#tutorialCanvas{display:block;background:white;border:2px solid #111;width:100%;height:min(32svh,240px);object-fit:contain}#tutorialScreen footer{width:min(600px,100%);justify-self:center}#tutorialScreen footer button{width:100%}#tutorialResult{min-height:48px;font-weight:700}#tutorialSkip{white-space:nowrap}@media(prefers-reduced-motion:reduce){.shot-kick.fire{animation:none}}
+`;document.head.append(extrasStyle);
+const kick=document.createElement('span');kick.className='shot-kick';kick.textContent='⌖';kick.setAttribute('aria-hidden','true');$('.board').append(kick);
+function shotFeedback(hit,touch=false){
+  if(!matchMedia('(prefers-reduced-motion: reduce)').matches){kick.classList.remove('fire');void kick.offsetWidth;kick.classList.add('fire')}
+  if(touch&&vibrationOn&&typeof navigator.vibrate==='function')try{navigator.vibrate(hit?18:10)}catch{}
+  if(!soundOn)return;
+  try{const Audio=window.AudioContext||window.webkitAudioContext;if(!Audio)return;audioContext??=new Audio();audioContext.resume().catch(()=>{});const t=audioContext.currentTime;
+    const pulse=(frequency,start,duration,volume)=>{const osc=audioContext.createOscillator(),gain=audioContext.createGain();osc.type='triangle';osc.frequency.setValueAtTime(frequency,start);osc.frequency.exponentialRampToValueAtTime(frequency*.45,start+duration);gain.gain.setValueAtTime(volume,start);gain.gain.exponentialRampToValueAtTime(.001,start+duration);osc.connect(gain);gain.connect(audioContext.destination);osc.start(start);osc.stop(start+duration)};
+    pulse(170,t,.07,.07);pulse(hit?490:280,t+.045,.065,.05);
+  }catch{}
+}
+const lobbyTools=document.createElement('div');lobbyTools.className='lobby-tools';lobbyTools.innerHTML='<button id="learnGame">新手教学</button><button id="soundSetting"></button><button id="vibrationSetting"></button>';$('#modeCards').parentElement.append(lobbyTools);
+function feedbackSettings(){const sound=$('#soundSetting'),vibration=$('#vibrationSetting');sound.textContent=`音效：${soundOn?'开':'关'}`;sound.setAttribute('aria-pressed',String(soundOn));vibration.textContent=`震动：${vibrationOn?'开':'关'}`;vibration.setAttribute('aria-pressed',String(vibrationOn));vibration.title='仅支持震动的设备生效';try{localStorage.setItem('blindSpotFeedback',JSON.stringify({sound:soundOn,vibration:vibrationOn}))}catch{}}
+$('#soundSetting').onclick=()=>{soundOn=!soundOn;feedbackSettings()};$('#vibrationSetting').onclick=()=>{vibrationOn=!vibrationOn;feedbackSettings()};feedbackSettings();
+
+// A separate practice surface; skipping never spends currency or changes a match.
+let tutorialStep=0, tutorialFired=false, tutorialScanned=false;
+const tutorialMarks=[],tutorialHits=new Set();
+const practiceBody=Array.from({length:19},(_,i)=>({x:140,y:40+i*10,part:'左腿'}));
+const practiceShots=[{x:177,y:180},{x:177,y:180},{x:177,y:90}];
+const tutorial=document.createElement('section');tutorial.id='tutorialScreen';tutorial.hidden=true;tutorial.setAttribute('aria-label','可跳过的新手教学');
+tutorial.innerHTML='<header><b id="tutorialProgress">新手教学 · 1/3</b><button class="secondary" id="tutorialSkip">跳过教学</button></header><div class="tutorial-body"><h2 id="tutorialTitle"></h2><p id="tutorialText"></p><canvas id="tutorialCanvas" width="320" height="260" aria-label="教学示意图，左腿和彩弹覆盖范围"></canvas><p id="tutorialResult" role="status"></p></div><footer><button class="primary" id="tutorialAction"></button></footer>';
+document.body.append(tutorial);
+function drawTutorial(){const c=$('#tutorialCanvas').getContext('2d');c.clearRect(0,0,320,260);c.lineWidth=18;c.strokeStyle='#222';c.lineCap='round';c.beginPath();c.moveTo(140,40);c.lineTo(140,220);c.stroke();
+  tutorialMarks.forEach((s,i)=>{c.beginPath();c.arc(s.x,s.y,32,0,Math.PI*2);c.fillStyle=i===1?'#e9348a88':'#f7bb1699';c.fill();if(s.gain>0){c.lineWidth=3;c.strokeStyle='#111';c.stroke()}});
+  if(!tutorialFired){const s=practiceShots[tutorialStep];c.beginPath();c.setLineDash([5,5]);c.arc(s.x,s.y,32,0,Math.PI*2);c.lineWidth=2;c.strokeStyle='#2c59ff';c.stroke();c.setLineDash([])}
+}
+function renderTutorial(){const titles=['擦到边，也算命中','同一位置，只算一次','扫描只说部位，不给位置'];const texts=['这里是一条示范腿。彩弹圆圈只要碰到一部分，也能计分。正式游戏开枪时人物完全隐藏。','再往同一处打一发，已覆盖的部分不重复加分。两个圆部分重叠时，仍会计算新碰到的部分。','第三发换个位置。射击后使用扫描，就知道这发碰到了哪个部位；扫描不会亮出人物轮廓。'];
+  $('#tutorialProgress').textContent=`新手教学 · ${tutorialStep+1}/3`;$('#tutorialTitle').textContent=titles[tutorialStep];$('#tutorialText').textContent=texts[tutorialStep];
+  $('#tutorialAction').textContent=!tutorialFired?`试射第 ${tutorialStep+1} 发`:tutorialStep<2?'下一步':!tutorialScanned?'扫描这一发（教学免费）':'完成，开始玩';drawTutorial();
+}
+function openTutorial(){if(netMode!=='lobby')return;tutorialStep=0;tutorialFired=tutorialScanned=false;tutorialMarks.length=0;tutorialHits.clear();$('#tutorialResult').textContent='按下面按钮试射，也可以随时跳过。';tutorial.hidden=false;$('#lobby').inert=true;$('#shell').inert=true;renderTutorial();$('#tutorialSkip').focus()}
+function closeTutorial(){tutorial.hidden=true;$('#lobby').inert=false;$('#shell').inert=false;try{localStorage.setItem('blindSpotTutorialSeen','1')}catch{}$('#learnGame').focus()}
+function tutorialAction(){if(!tutorialFired){const p=practiceShots[tutorialStep],before=tutorialHits.size;practiceBody.forEach((q,i)=>{if(distance(q,p)<=32+9)tutorialHits.add(i)});const gain=tutorialHits.size-before;tutorialMarks.push({...p,gain});tutorialFired=true;$('#tutorialResult').textContent=gain?'新增命中！擦到的一部分也计分。':'这处已经打过，没有新增命中，不重复加分。';shotFeedback(gain>0,false)}else if(tutorialStep<2){tutorialStep++;tutorialFired=false;$('#tutorialResult').textContent='继续试射，观察这一发的反馈。'}else if(!tutorialScanned){tutorialScanned=true;$('#tutorialResult').textContent='扫描结果：刚刚命中左腿。不会标出它的方向或位置。'}else{closeTutorial();return}renderTutorial()}
+$('#tutorialAction').onclick=tutorialAction;$('#tutorialSkip').onclick=closeTutorial;$('#learnGame').onclick=openTutorial;
+document.addEventListener('keydown',e=>{if(!tutorial.hidden&&e.key==='Escape')closeTutorial()});
+$('#startLocalMatch').onclick=startLocalMatch;$('#createRoom').onclick=createOnlineRoom;
+panel();
+const invitedRoom=new URLSearchParams(location.search).get('room');
+if(invitedRoom!==null){lobbyView('joinBox');if(/^\d{6}$/.test(invitedRoom)){$('#roomInput').value=invitedRoom;$('#joinStatus').textContent='正在加入朋友的房间…';joinOnlineRoom()}else $('#joinStatus').textContent='邀请链接里的房间号无效，请向朋友重新获取链接。'}
+else{let seen=false;try{seen=localStorage.getItem('blindSpotTutorialSeen')==='1'}catch{}if(!seen)openTutorial()}
 
   })();
   </script>
