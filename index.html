@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
-  <meta name="app-version" content="20260905-fair-invite-tutorial">
+  <meta name="app-version" content="20260905-continuous-reports">
   <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
   <title>盲区 BLIND SPOT</title>
   <style>
@@ -107,7 +107,8 @@
       else if(data.type==='shotProgress'&&netRole==='hider'){
         if(data.shot&&data.count>shots.length)shots.push({...data.shot,x:data.shot.x*W,y:data.shot.y*H});
         remoteAim=data.shot?{x:data.shot.x*W,y:data.shot.y*H}:remoteAim;
-        $('#netWaitTitle').textContent=data.count>=BULLETS?'对方弹药已用完':'对方正在开枪';        $('#netWaitText').textContent=`已实时看到 ${data.count}/${BULLETS} 发；人物轮廓仍会等到揭晓时出现。`;
+        $('#netWaitTitle').textContent=data.count>=BULLETS?'对方弹药已用完':'对方正在开枪';
+        $('#netWaitText').textContent=`已实时看到 ${data.count}/${BULLETS} 发；人物轮廓仍会等到揭晓时出现。`;
         draw();
       }
       else if(data.type==='reveal'&&netRole==='hider'){sendNet({type:'revealAck',revealId:data.revealId});if(phase==='reveal')return;remoteAim=null;creature=data.creature;const mapped=mapArena(data.points,data.shots,data.arena.w,data.arena.h,W,H,false);points=mapped.points;shots=mapped.shots;rebuildHits();hideOnlineWait();go('reveal');$('#revealNote').textContent='对方已揭晓 · 人物和彩弹已叠加';toast('对方已揭晓，本轮人物和彩弹已显示')}
@@ -405,7 +406,7 @@ cleanupNetwork=function(){fairScanRound='';fairScans=FAIR_SCANS;coreCleanup()};
 const invitation=document.createElement('div');invitation.className='invite-actions';
 invitation.innerHTML='<button class="primary" id="shareRoom">分享邀请链接</button><button class="secondary" id="copyRoom">复制邀请链接</button><input id="inviteFallback" aria-label="邀请链接，长按复制" readonly hidden><p id="inviteStatus" role="status"></p>';
 $('#waitingBox').insertBefore(invitation,$('#waitingBox .backLobby:not(.subclose)'));
-function inviteLink(code=roomCode){return /^\d{6}$/.test(code)?`https://himrhow.github.io/blind-spot-game/?room=${code}&v=20260905-fair-invite-tutorial`:null}
+function inviteLink(code=roomCode){return /^\d{6}$/.test(code)?`https://himrhow.github.io/blind-spot-game/?room=${code}&v=20260905-continuous-reports`:null}
 async function copyInvite(){const url=inviteLink();if(!url||!peer?.open){$('#inviteStatus').textContent='房间还在连接，请稍等片刻';return}try{if(!navigator.clipboard?.writeText)throw Error();await navigator.clipboard.writeText(url);$('#inviteStatus').textContent='邀请链接已复制，发给朋友即可'}catch{const input=$('#inviteFallback');input.hidden=false;input.value=url;input.focus();input.select();$('#inviteStatus').textContent='请长按或选中上面的邀请链接复制'}}
 $('#copyRoom').onclick=copyInvite;
 $('#shareRoom').onclick=async()=>{const url=inviteLink();if(!url||!peer?.open){$('#inviteStatus').textContent='房间还在连接，请稍等片刻';return}if(!navigator.share)return copyInvite();try{await navigator.share({title:'来玩一局盲区',text:'一个人藏，一个人找。点链接加入我的房间！',url});$('#inviteStatus').textContent='已打开分享，请等待朋友加入'}catch(error){if(error.name!=='AbortError')await copyInvite()}};
@@ -509,6 +510,92 @@ canvas.addEventListener('pointerdown',modePointer);canvas.addEventListener('poin
 const modeStyle=document.createElement('style');modeStyle.textContent=`.play-mode select{min-height:54px}.modeplay .board canvas{cursor:crosshair}.selected strong{font-size:18px}.mode-pack-card{border:2px solid #111;padding:10px;background:#fff}.panel[data-phase='modeplay'] .buttons{grid-column:1/-1}@media(orientation:portrait){.play-mode select{font-size:13px}.panel[data-phase='modeplay']{grid-template-columns:1fr}.panel[data-phase='modeplay'] .buttons{grid-template-columns:1fr 1fr}}`;document.head.append(modeStyle);
 // Install overrides only after the base page has finished its initial setup.
 newMatch=modeNewMatch;draw=modeDraw;go=modeGo;panel=modePanelRender;startLocalMatch=modeStartLocalMatch;createOnlineRoom=modeCreateOnlineRoom;choose=modeChoose;receiveNet=modeReceiveNet;
+
+// Responsive playfield, continuous rounds, shareable reports, history, and
+// original sticker interactions. This is installed after the mode pack.
+const CONTINUE_SECONDS=6,REPORT_LIMIT=8;
+let roundClock=0,roundClockKey='',roundRemaining=CONTINUE_SECONDS,reportSavedKey='';
+let reports=[];try{reports=JSON.parse(localStorage.getItem('blindSpotReports')||'[]');if(!Array.isArray(reports))reports=[]}catch{reports=[]}
+const roundBasePanel=panel,roundBaseGo=go,roundBaseDraw=draw,roundBaseReceive=receiveNet,roundBaseCleanup=cleanupNetwork;
+const roundBaseStartLocal=startLocalMatch,roundBaseEnterGame=enterGame,roundBaseShowEmote=showEmote,roundBaseRandomPose=randomPose,roundBaseAdvance=advanceRound;
+
+const roundStyle=document.createElement('style');roundStyle.textContent=`
+  .stage{grid-template-columns:minmax(0,1fr) clamp(230px,21vw,280px)}
+  .result{top:12px;left:12px;right:auto;bottom:auto;min-height:0;max-width:min(390px,calc(100% - 24px));padding:8px 12px;gap:10px;background:#fffffff2;pointer-events:none;box-shadow:4px 4px 0 #111}
+  .result .revealnote,.result>.summary,.result .eyebrow{display:none}.result .score{gap:10px}.result .score strong{font-size:34px}.result .score span{font-size:9px}.result .score small{display:none}
+  .reveal-compact{display:grid;gap:10px;height:100%;align-content:space-between}.reveal-top{display:grid;gap:4px}.reveal-score{font-size:clamp(28px,4vh,44px);font-weight:950;letter-spacing:-.06em}.reveal-score small{font-size:12px;letter-spacing:0;color:#666}.round-countdown{display:flex;align-items:center;gap:9px;border:2px solid #111;padding:9px 10px;background:#fff7d5;font-size:12px;font-weight:900}.round-countdown b{display:grid;place-items:center;width:34px;height:34px;border-radius:50%;background:#111;color:#fff;font-size:18px}.reveal-actions{display:grid;grid-template-columns:1fr 1fr;gap:8px}.reveal-actions .primary{grid-column:1/-1}.reveal-actions button{min-height:44px}
+  #reportHistory{position:fixed;z-index:92;inset:0;background:#f3f1ec;overflow:auto;padding:max(18px,env(safe-area-inset-top)) clamp(16px,4vw,46px) max(22px,env(safe-area-inset-bottom))}#reportHistory[hidden]{display:none!important}
+  .history-head{position:sticky;top:0;z-index:2;display:flex;justify-content:space-between;align-items:center;gap:12px;padding:8px 0 16px;background:#f3f1ec}.history-head h2{margin:0;font-size:clamp(28px,6vw,52px);letter-spacing:-.06em}.history-close{width:48px;height:48px;border:2px solid #111;background:#fff;box-shadow:3px 3px #111;font-size:28px}
+  .history-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,300px),1fr));gap:18px}.history-card{border:2px solid #111;background:#fff;box-shadow:5px 5px #111;padding:10px;display:grid;gap:9px}.history-card img{display:block;width:100%;aspect-ratio:3/2;object-fit:cover;border:1px solid #111;background:#fff}.history-card strong{font-size:16px}.history-card small{color:#666}.history-card .buttons{grid-template-columns:1fr 1fr}.history-empty{border:2px dashed #111;padding:32px;text-align:center;background:#fff}
+  #stickerStage{position:absolute;z-index:14;inset:0;pointer-events:none;overflow:hidden}#stickerStage[hidden]{display:none}.sticker-pop{position:absolute;left:50%;top:42%;transform:translate(-50%,-50%);display:grid;place-items:center;text-align:center;font-weight:950;color:#111;filter:drop-shadow(4px 4px 0 #fff);animation:stickerPop 2.4s ease both}.sticker-pop .emoji{font-size:clamp(76px,14vw,150px);line-height:1}.sticker-pop b{margin-top:-8px;padding:7px 12px;border:2px solid #111;background:#fff;font-size:clamp(15px,3vw,25px)}
+  .sticker-pop.headpat .emoji{animation:headPat .42s ease-in-out 4 alternate}.sticker-pop.headpat:before,.sticker-pop.headpat:after{content:'✦';position:absolute;color:#f7bb16;font-size:38px;animation:spark .7s ease-in-out infinite alternate}.sticker-pop.headpat:before{left:-34px;top:42px}.sticker-pop.headpat:after{right:-34px;top:80px}.sticker-pop.taunt{animation:tauntPop 2.4s ease both}
+  @keyframes stickerPop{0%{opacity:0;transform:translate(-50%,-35%) scale(.65)}12%,78%{opacity:1;transform:translate(-50%,-50%) scale(1)}100%{opacity:0;transform:translate(-50%,-62%) scale(.9)}}@keyframes headPat{from{transform:translateY(-18px) rotate(-7deg)}to{transform:translateY(12px) rotate(7deg)}}@keyframes spark{from{transform:scale(.6) rotate(0)}to{transform:scale(1.25) rotate(28deg)}}@keyframes tauntPop{0%{opacity:0;transform:translate(-50%,-50%) rotate(-10deg) scale(.5)}18%,75%{opacity:1;transform:translate(-50%,-50%) rotate(3deg) scale(1)}100%{opacity:0;transform:translate(-50%,-50%) rotate(10deg) scale(.7)}}
+  @media(max-width:900px) and (orientation:landscape){.stage{grid-template-columns:minmax(0,1fr) min(255px,34vw)}.reveal-actions{grid-template-columns:1fr}.reveal-actions .primary{grid-column:auto}.panel[data-phase='reveal']{padding:10px}.reveal-score{font-size:27px}.round-countdown{padding:6px}.round-countdown b{width:28px;height:28px}}
+  @media(orientation:portrait){.stage{grid-template-columns:1fr;grid-template-rows:minmax(0,1fr) 150px}.panel[data-phase='reveal']{height:150px;grid-template-columns:minmax(0,1fr) minmax(150px,.8fr);display:grid}.panel[data-phase='reveal'] .reveal-compact{display:contents}.panel[data-phase='reveal'] .reveal-top{align-self:center}.panel[data-phase='reveal'] .round-countdown{align-self:center}.panel[data-phase='reveal'] .reveal-actions{grid-column:1/-1;grid-template-columns:1fr 1fr 1fr}.panel[data-phase='reveal'] .reveal-actions .primary{grid-column:auto}.panel[data-phase='reveal'] .reveal-actions button{min-height:36px;padding:6px;font-size:11px}.result{top:7px;left:7px;padding:5px 8px}.result .score strong{font-size:27px}}
+  @media(prefers-reduced-motion:reduce){.sticker-pop,.sticker-pop.headpat .emoji,.sticker-pop.headpat:before,.sticker-pop.headpat:after{animation:none}}
+`;document.head.append(roundStyle);
+
+// Keep the logical canvas aspect ratio equal to the real visible board. This
+// removes unreachable letterbox strips while preserving the same 600-unit
+// short side and therefore the same shot size on phone and desktop.
+let arenaSyncing=false;
+function syncVisibleArena(){if(arenaSyncing||netMode==='lobby'||!canvas.isConnected)return;const rect=canvas.getBoundingClientRect();if(rect.width<80||rect.height<80)return;const ratio=rect.width/rect.height;let nextW,nextH;if(ratio>=1){nextH=600;nextW=Math.round(600*ratio)}else{nextW=600;nextH=Math.round(600/ratio)}nextW=Math.max(600,Math.min(1180,nextW));nextH=Math.max(600,Math.min(1180,nextH));if(Math.abs(nextW-W)<5&&Math.abs(nextH-H)<5)return;arenaSyncing=true;const oldW=W,oldH=H,mapped=mapArena(points,shots,W,H,nextW,nextH,false);W=nextW;H=nextH;points=mapped.points;shots=mapped.shots;if(remoteAim)remoteAim={x:remoteAim.x/oldW*W,y:remoteAim.y/oldH*H};if(modeTargetPoints)modeTargetPoints=mapArena(modeTargetPoints,[],oldW,oldH,W,H,false).points;if(modeGuessPoints)modeGuessPoints=mapArena(modeGuessPoints,[],oldW,oldH,W,H,false).points;modeMarks=modeMarks.map(p=>({...p,x:p.x/oldW*W,y:p.y/oldH*H}));canvas.width=W;canvas.height=H;rebuildHits();arenaSyncing=false;panel();draw()}
+if(window.ResizeObserver)new window.ResizeObserver(()=>requestAnimationFrame(syncVisibleArena)).observe(canvas);
+addEventListener('resize',()=>requestAnimationFrame(syncVisibleArena));
+if(window.MutationObserver)new window.MutationObserver(()=>requestAnimationFrame(syncVisibleArena)).observe($('#shell'),{attributes:true,attributeFilter:['class']});
+
+const spookyPresets={
+  cat:[
+    {name:'炸毛拱背',targets:{head:[.72,.45],shoulder:[.60,.38],hip:[.37,.29],tailMid:[.20,.16],tailTip:[.10,.08],frontPawA:[.72,.78],frontPawB:[.82,.70],backPawA:[.27,.78],backPawB:[.43,.82]}},
+    {name:'贴地扑击',targets:{head:[.79,.43],shoulder:[.64,.47],hip:[.39,.52],tailMid:[.22,.35],tailTip:[.08,.22],frontPawA:[.83,.67],frontPawB:[.76,.75],backPawA:[.25,.70],backPawB:[.35,.78]}},
+    {name:'回头盯人',targets:{head:[.58,.35],neck:[.62,.43],shoulder:[.59,.50],hip:[.37,.46],tailMid:[.21,.30],tailTip:[.12,.48],frontPawA:[.68,.78],frontPawB:[.55,.82],backPawA:[.28,.75],backPawB:[.42,.82]}}
+  ],
+  bird:[
+    {name:'俯冲怪鸟',targets:{head:[.72,.67],neck:[.62,.55],chest:[.54,.49],tailRoot:[.35,.32],tailMid:[.23,.20],tailTip:[.10,.10],wingTip:[.28,.73],footL:[.57,.82],footR:[.68,.78]}},
+    {name:'折翼扑面',targets:{head:[.68,.35],neck:[.59,.44],chest:[.55,.54],tailRoot:[.31,.58],tailMid:[.20,.67],tailTip:[.08,.78],wingElbow:[.43,.28],wingTip:[.28,.12],footL:[.48,.77],footR:[.62,.78]}},
+    {name:'扭头窥视',targets:{head:[.53,.28],neck:[.60,.39],chest:[.60,.51],tailRoot:[.35,.55],tailMid:[.22,.47],tailTip:[.08,.38],wingElbow:[.45,.56],wingTip:[.28,.70],footL:[.48,.78],footR:[.63,.78]}}
+  ]
+};
+function validPose(candidate){const before=points;points=candidate;const ok=overlaps()<=2&&def().constraints.every(c=>{const d=distance(points[c.a],points[c.b]);return d>=c.rest*c.min-4&&d<=c.rest*c.max+4});points=before;return ok}
+randomPose=function(){if(phase!=='pose')return;if(!spookyPresets[creature]){roundBaseRandomPose();return}cancelAnimationFrame(jiggle);const presets=spookyPresets[creature],start=Math.floor(Math.random()*presets.length);for(let attempt=0;attempt<presets.length*3;attempt++){const preset=presets[(start+attempt)%presets.length];let candidate=mapArena(def().points,[],BASE_W,BASE_H,W,H,true).points;const before=points;points=candidate;for(const [key,[nx,ny]] of Object.entries(preset.targets)){if(points[key])points=solve(points,key,{x:Math.max(48,Math.min(W-48,W*nx+(Math.random()-.5)*18)),y:Math.max(48,Math.min(H-48,H*ny+(Math.random()-.5)*18))})}candidate=mapArena(points,[],W,H,W,H,false).points;points=before;if(validPose(candidate)){points=candidate;panel();draw();toast(`${preset.name}！还能继续拖关节微调`);return}}roundBaseRandomPose()};
+
+function reportCaption(search,hide){if(search>=850)return '藏得挺好，下次别藏了。';if(search>=650)return '这不是蒙的，这是战术直觉。';if(hide>=700)return '你打你的，我躲我的。';if(hide>=500)return '双方都说自己差一点就赢。';return '现场很乱，但气氛到位。'}
+function buildReportCanvas(){const out=document.createElement('canvas');out.width=1200;out.height=800;const c=out.getContext('2d');if(!c)return null;const search=Number($('#scoreB').textContent)||0,hide=Number($('#scoreA').textContent)||0;c.fillStyle='#f3f1ec';c.fillRect(0,0,1200,800);c.fillStyle='#111';c.fillRect(0,0,1200,78);c.fillStyle='#fff';c.font='900 34px Arial,"PingFang SC",sans-serif';c.fillText('盲区 BLIND SPOT · 现场战报',38,51);c.save();c.fillStyle='#fff';c.fillRect(45,104,1110,535);c.strokeStyle='#111';c.lineWidth=5;c.strokeRect(45,104,1110,535);const scale=Math.min(1060/canvas.width,485/canvas.height),dw=canvas.width*scale,dh=canvas.height*scale;c.drawImage(canvas,70+(1060-dw)/2,129+(485-dh)/2,dw,dh);c.restore();c.fillStyle='#ff4f36';c.fillRect(45,664,1110,96);c.fillStyle='#fff';c.font='900 39px Arial,"PingFang SC",sans-serif';c.fillText(`${playerNames[1-match?.hider]||'寻找方'} ${search} : ${hide} ${playerNames[match?.hider]||'藏匿方'}`,73,710);c.font='800 22px Arial,"PingFang SC",sans-serif';c.fillText(reportCaption(search,hide),73,744);c.font='52px sans-serif';c.fillText(search>hide?'🎯 😏':'👻 🙈',1015,731);return out}
+function saveCurrentReport(){const key=match?`${match.id}:${match.round}`:`${Date.now()}:${shots.length}`;if(reportSavedKey===key)return reports[0];const image=buildReportCanvas();if(!image||typeof image.toDataURL!=='function')return null;let data='';try{data=image.toDataURL('image/webp',.84)}catch{return null}const search=Number($('#scoreB').textContent)||0,hide=Number($('#scoreA').textContent)||0,mime=data.match(/^data:([^;]+)/)?.[1]||'image/png';const entry={id:`${Date.now()}-${Math.random().toString(36).slice(2,7)}`,time:Date.now(),creature:def().label,mode:currentMode().label,search,hide,caption:reportCaption(search,hide),mime,data};reports=[entry,...reports.filter(r=>r.id!==entry.id)].slice(0,REPORT_LIMIT);while(reports.length){try{localStorage.setItem('blindSpotReports',JSON.stringify(reports));break}catch{reports.pop()}}reportSavedKey=key;return entry}
+function downloadReport(entry=reports[0]){if(!entry?.data){toast('战报还在生成，请稍等一下');return}const a=document.createElement('a'),ext=(entry.mime||'').includes('webp')?'webp':'png';a.href=entry.data;a.download=`盲区战报-${new Date(entry.time).toISOString().slice(0,10)}.${ext}`;document.body.append(a);a.click();a.remove()}
+async function shareReport(entry=reports[0]){if(!entry?.data){toast('战报还在生成，请稍等一下');return}try{const blob=await(await fetch(entry.data)).blob(),ext=(entry.mime||blob.type).includes('webp')?'webp':'png',file=new File([blob],`盲区战报.${ext}`,{type:blob.type||entry.mime||'image/png'});if(navigator.share&&navigator.canShare?.({files:[file]})){await navigator.share({title:'盲区现场战报',text:entry.caption,files:[file]});return}}catch(error){if(error?.name==='AbortError')return}downloadReport(entry)}
+
+const historyScreen=document.createElement('section');historyScreen.id='reportHistory';historyScreen.hidden=true;historyScreen.innerHTML='<div class="history-head"><div><p class="eyebrow">最近 8 局 · 随时回来保存</p><h2>搞怪战报</h2></div><button class="history-close" aria-label="关闭战报历史">×</button></div><div class="history-grid" id="historyGrid"></div>';document.body.append(historyScreen);
+const historyButton=document.createElement('button');historyButton.id='openHistory';historyButton.textContent='最近战报';lobbyTools.append(historyButton);
+function renderHistory(){const grid=$('#historyGrid');grid.innerHTML=reports.length?reports.map((r,i)=>`<article class="history-card"><img src="${r.data}" alt="${r.creature}战报缩略图"><strong>${r.mode} · ${r.search} : ${r.hide}</strong><small>${new Date(r.time).toLocaleString()} · ${r.caption}</small><div class="buttons"><button class="secondary" data-download="${i}">下载</button><button class="primary" data-share="${i}">分享</button></div></article>`).join(''):'<p class="history-empty">还没有战报。完成一轮后，这里会自动保留最近 8 局。</p>';grid.querySelectorAll('[data-download]').forEach(b=>b.onclick=()=>downloadReport(reports[Number(b.dataset.download)]));grid.querySelectorAll('[data-share]').forEach(b=>b.onclick=()=>shareReport(reports[Number(b.dataset.share)]))}
+function openHistory(){renderHistory();historyScreen.hidden=false;$('#lobby').inert=true;$('#shell').inert=true;historyScreen.querySelector('.history-close').focus()}
+function closeHistory(){historyScreen.hidden=true;$('#lobby').inert=false;$('#shell').inert=false}
+historyButton.onclick=openHistory;historyScreen.querySelector('.history-close').onclick=closeHistory;
+
+function revealKey(){return match?`${match.id}:${match.round}:${netMode}`:`${Date.now()}:${shots.length}`}
+function updateRoundClock(){const el=$('#roundCountdownValue');if(el)el.textContent=String(roundRemaining);const text=$('#roundCountdownText');if(text)text.textContent=netMode==='online'&&nextReady?'已准备，等待对方…':roundRemaining>0?`${roundRemaining} 秒后自动${matchOver()?'开下一场':'交换攻守'}`:'正在进入下一轮…'}
+advanceRound=function(){if(netMode==='online'&&matchOver()){const nextHider=1-match.hider,nextId=`${match.id}:next`;match=newMatch(match.mode,nextId);match.hider=nextHider;nextReady=peerReady=false;enterGame(nextHider===localSeat?'hider':'guesser');updateMatchBanner();return}roundBaseAdvance()};
+function advanceAutomatically(){clearInterval(roundClock);roundClock=0;if(phase!=='reveal'||networkPaused)return;if(netMode==='online')nextMatchRound();else advanceRound()}
+function startRoundClock(){const key=revealKey();if(roundClockKey===key)return;clearInterval(roundClock);roundClockKey=key;roundRemaining=CONTINUE_SECONDS;updateRoundClock();roundClock=setInterval(()=>{if(phase!=='reveal'){clearInterval(roundClock);roundClock=0;return}if(networkPaused)return;roundRemaining--;updateRoundClock();if(roundRemaining<=0)advanceAutomatically()},1000);setTimeout(()=>{if(phase==='reveal'){saveCurrentReport();renderHistory()}},80)}
+function renderCompactReveal(){const el=$('#panel'),search=Number($('#scoreB').textContent)||0,hide=Number($('#scoreA').textContent)||0;el.innerHTML=`<div class="reveal-compact"><div class="reveal-top"><p class="eyebrow">本轮结束 · ${currentMode().label}</p><div class="reveal-score">${search} : ${hide} <small>找 / 藏</small></div><p>${reportCaption(search,hide)}</p></div><div class="round-countdown"><b id="roundCountdownValue">${roundRemaining}</b><span id="roundCountdownText"></span></div><div class="reveal-actions"><button class="secondary" id="downloadRound">保存 / 分享</button><button class="secondary" id="historyRound">最近记录</button><button class="primary" id="nextRoundNow">立即${matchOver()?'下一场':'换边'}</button></div></div>`;$('#downloadRound').onclick=()=>shareReport(saveCurrentReport());$('#historyRound').onclick=openHistory;$('#nextRoundNow').onclick=advanceAutomatically;updateRoundClock()}
+panel=function(){roundBasePanel();if(phase==='reveal'){renderCompactReveal();startRoundClock()}};
+go=function(next){if(next!=='reveal'){clearInterval(roundClock);roundClock=0;roundClockKey=''}roundBaseGo(next);if(next==='reveal')requestAnimationFrame(()=>{draw();saveCurrentReport();renderHistory()});requestAnimationFrame(syncVisibleArena)};
+draw=function(){roundBaseDraw()};
+startLocalMatch=function(){roundBaseStartLocal();setTimeout(syncVisibleArena,0)};
+enterGame=function(role){roundBaseEnterGame(role);setTimeout(syncVisibleArena,0)};
+cleanupNetwork=function(){clearInterval(roundClock);roundClock=0;roundClockKey='';roundBaseCleanup()};
+
+// Add original sticker-like reactions to the existing online emote protocol.
+const stickerStage=document.createElement('div');stickerStage.id='stickerStage';stickerStage.hidden=true;$('.board').append(stickerStage);
+const extraEmotes=['🫳 摸摸头，不哭','🐼 菜得很有风格','👻 我就在你旁边','💥 这发打空气了','🧠 我已经看穿了'];
+const firstExtra=emotes.length;extraEmotes.forEach((text,offset)=>{const index=emotes.push(text)-1,b=document.createElement('button');b.textContent=text;b.onclick=()=>sendEmote(index);$('#emoteMenu').insertBefore(b,muteEmotes)});
+function showSticker(index){if(index<firstExtra)return;const text=emotes[index],headpat=index===firstExtra,emoji=headpat?'🫳':text.split(' ')[0];stickerStage.innerHTML=`<div class="sticker-pop ${headpat?'headpat':'taunt'}"><span class="emoji">${emoji}</span><b>${text.replace(/^\S+\s*/, '')}</b></div>`;stickerStage.hidden=false;setTimeout(()=>{stickerStage.hidden=true;stickerStage.innerHTML=''},2400)}
+showEmote=function(index,own=false){roundBaseShowEmote(index,own);showSticker(index)};
+receiveNet=function(data){roundBaseReceive(data);if(data?.type==='roundReady'&&phase==='reveal')updateRoundClock()};
+
+// Rebind handlers created before these final wrappers were installed.
+$('#startLocalMatch').onclick=startLocalMatch;
+panel();
 
   })();
   </script>
